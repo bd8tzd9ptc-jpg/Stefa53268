@@ -1,0 +1,13 @@
+name: Verifica GitHub Actions
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  verifica:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conferma avvio
+        run: echo "GitHub Actions funziona"
