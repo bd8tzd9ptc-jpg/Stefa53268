@@ -9,5 +9,8 @@ jobs:
   verifica:
     runs-on: ubuntu-latest
     steps:
-      - name: Conferma avvio
-        run: echo "GitHub Actions funziona"
+      - name: Controlla accesso a Tribuna
+        run: |
+          curl --silent --show-error --max-time 20 \
+            --output /dev/null --write-out 'HTTP %{http_code}\n' \
+            'https://tribuna-biancorossa.confidentantelope1.chatgpt.site/api/updates'
