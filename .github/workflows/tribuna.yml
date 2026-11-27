@@ -1,0 +1,35 @@
+name: Verifica accesso Tribuna
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+
+jobs:
+  verifica:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verifica autorizzazione senza scrivere dati
+        run: |
+          node --input-type=module <<'JS'
+          const endpoint = 'https://tribuna-biancorossa.confidentantelope1.chatgpt.site/api/automation/verify';
+          const githubUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          githubUrl.searchParams.set('audience', endpoint);
+          const issued = await fetch(githubUrl, {
+            headers: { Authorization: 'Bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN },
+            redirect: 'error',
+            signal: AbortSignal.timeout(10000)
+          });
+          if (!issued.ok) throw new Error('Token GitHub non disponibile (HTTP ' + issued.status + ')');
+          const { value } = await issued.json();
+          if (typeof value !== 'string' || !value) throw new Error('Token GitHub mancante');
+          const check = await fetch(endpoint, {
+            headers: { 'X-Tribuna-Automation': value },
+            redirect: 'error',
+            signal: AbortSignal.timeout(15000)
+          });
+          if (check.status !== 204) throw new Error('Verifica Tribuna: HTTP ' + check.status);
+          console.log('Accesso del workflow verificato (HTTP 204)');
+          JS
