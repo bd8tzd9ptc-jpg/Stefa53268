@@ -1,35 +1,378 @@
-name: Verifica accesso Tribuna
+name: Aggiorna calendari e risultati Tribuna
 
 on:
   workflow_dispatch:
+    inputs:
+      apply:
+        description: Salva le variazioni su Tribuna
+        type: boolean
+        default: false
+  schedule:
+    - cron: '2-57/5 * * * *'
 
 permissions:
   id-token: write
 
+concurrency:
+  group: tribuna-calendar-production
+
 jobs:
-  verifica:
+  aggiorna:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
+    env:
+      TRIBUNA_APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
     steps:
-      - name: Verifica autorizzazione senza scrivere dati
+      - name: Controlla i calendari e salva le variazioni
+        shell: bash
         run: |
-          node --input-type=module <<'JS'
-          const endpoint = 'https://tribuna-biancorossa.confidentantelope1.chatgpt.site/api/automation/verify';
-          const githubUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
-          githubUrl.searchParams.set('audience', endpoint);
-          const issued = await fetch(githubUrl, {
-            headers: { Authorization: 'Bearer ' + process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN },
-            redirect: 'error',
-            signal: AbortSignal.timeout(10000)
-          });
-          if (!issued.ok) throw new Error('Token GitHub non disponibile (HTTP ' + issued.status + ')');
-          const { value } = await issued.json();
-          if (typeof value !== 'string' || !value) throw new Error('Token GitHub mancante');
-          const check = await fetch(endpoint, {
-            headers: { 'X-Tribuna-Automation': value },
-            redirect: 'error',
-            signal: AbortSignal.timeout(15000)
-          });
-          if (check.status !== 204) throw new Error('Verifica Tribuna: HTTP ' + check.status);
-          console.log('Accesso del workflow verificato (HTTP 204)');
-          JS
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import unicodedata
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import date, datetime
+          from html import unescape
+          from urllib.error import HTTPError
+          from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+          from zoneinfo import ZoneInfo
+
+          SITE = "https://tribuna-biancorossa.confidentantelope1.chatgpt.site"
+          VERIFY = SITE + "/api/automation/verify"
+          SERIE_A = "https://api-sdp.legaseriea.it/v1/serie-a/football"
+          COMPETITION = "serie-a::Football_Competition::ec93b94f74294dc98ab5bcfd67fc0d88"
+          FCS = "https://www.legab.it/seriebkt/calendario/{season}/stagione-regolare/sudtirol"
+          HCB = "https://www.hcb.net/it/team/calendario-icehl/"
+          ORF = "https://sport.orf.at/tabellen/stories/3000641/"
+          ROME = ZoneInfo("Europe/Rome")
+          MONTHS = "gennaio febbraio marzo aprile maggio giugno luglio agosto settembre ottobre novembre dicembre".split()
+          ALIASES = {
+              "atalanta bc": "atalanta", "bologna fc 1909": "bologna", "cagliari calcio": "cagliari",
+              "frosinone calcio": "frosinone", "parma calcio": "parma", "u s lecce": "lecce",
+              "u s sassuolo calcio": "sassuolo", "udinese calcio": "udinese", "venezia fc": "venezia",
+              "fc sudtirol": "sudtirol", "lr vicenza": "vicenza", "l r vicenza": "vicenza",
+              "hcb sudtirol alperia": "bolzano", "hc bolzano": "bolzano", "bozen": "bolzano",
+              "hc falkensteiner pustertal": "pustertal", "ec kac": "kac",
+              "steinbach black wings linz": "linz", "ec red bull salzburg": "salzburg",
+              "milano hc": "milano", "olimpija ljubljana": "ljubljana",
+              "hydro fehervar av 19": "fehervar", "pioneers vorarlberg": "vorarlberg",
+              "hc tiwag innsbruck die haie": "innsbruck", "moser medical graz99ers": "graz",
+              "ec idm warmepumpen vsv": "vsv", "ftc telekom": "budapest", "vienna capitals": "vienna",
+          }
+
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          OPENER = build_opener(NoRedirect())
+
+
+          def request(url, *, token=None, payload=None, oidc_header="X-Tribuna-Automation"):
+              headers = {"User-Agent": "TribunaBiancorossa/1.0", "Cache-Control": "no-cache"}
+              if token:
+                  headers[oidc_header] = ("Bearer " if oidc_header == "Authorization" else "") + token
+              body = None
+              if payload is not None:
+                  headers["Content-Type"] = "application/json"
+                  body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+              req = Request(url, data=body, headers=headers, method="PUT" if payload is not None else "GET")
+              with OPENER.open(req, timeout=18) as response:
+                  data = response.read(4_000_001)
+                  if len(data) > 4_000_000:
+                      raise ValueError("Risposta oltre il limite")
+                  return response.status, data
+
+
+          def text(url):
+              return request(url)[1].decode("utf-8")
+
+
+          def read_json(url):
+              return json.loads(request(url)[1])
+
+
+          def key(name):
+              value = unicodedata.normalize("NFKD", name.casefold())
+              value = "".join(c for c in value if not unicodedata.combining(c))
+              value = " ".join(re.findall(r"[a-z0-9]+", value))
+              return ALIASES.get(value, value)
+
+
+          def clean(value):
+              return " ".join(unescape(re.sub(r"<[^>]+>", " ", value)).split())
+
+
+          def fixture(day, start, home, away, competition, result=""):
+              date.fromisoformat(day)
+              if start and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start):
+                  raise ValueError("Orario non riconosciuto")
+              if not key(home) or not key(away) or key(home) == key(away):
+                  raise ValueError("Squadre non riconosciute")
+              return {"date": day, "time": start, "home": home, "away": away,
+                      "competition": competition, "result": result, "note": ""}
+
+
+          def score(home, away):
+              if any(type(n) is not int or not 0 <= n <= 99 for n in (home, away)):
+                  raise ValueError("Risultato non riconosciuto")
+              return f"{home}–{away}"
+
+
+          def monza(matches):
+              rows = []
+              for match in matches["matches"]:
+                  home, away = (match[side]["shortName"] for side in ("home", "away"))
+                  if "monza" not in (key(home), key(away)):
+                      continue
+                  local = datetime.fromisoformat(match["matchDateLocal"])
+                  final = match["status"] == "FINISHED" and match["phase"] == "FULL_TIME"
+                  if not final and match["status"] != "UPCOMING":
+                      continue
+                  result = score(match["providerHomeScore"], match["providerAwayScore"]) if final else ""
+                  start = local.strftime("%H:%M") if match["isUnknownKickOffTime"] is False else ""
+                  rows.append(fixture(local.date().isoformat(), start, home, away, "Serie A", result))
+              return rows
+
+
+          def load_monza(year):
+              seasons = read_json(f"{SERIE_A}/competitions/{quote(COMPETITION, safe='')}/seasons?locale=en-GB")
+              season = next(s["seasonId"] for s in seasons["seasons"] if s["seasonName"] == f"{year}/{year+1}")
+              rows = monza(read_json(f"{SERIE_A}/seasons/{quote(season, safe='')}/matches?locale=en-GB"))
+              return rows, [{"label": "Lega Serie A · Monza", "url": "https://www.legaseriea.it/team/monza"}]
+
+
+          def sudtirol(html):
+              rows = []
+              for card in html.split('class="card matchday matchday-list')[1:]:
+                  identity = re.search(r'<span class="visually-hidden">([^<]+)</span>', card)
+                  state = re.search(r'<div class="stato ([^"]*)">', card)
+                  if not identity or not state:
+                      continue
+                  info = re.fullmatch(r"\w+, (\d{1,2}) (\w+) (\d{4}), (.+?) - (.+?), ore:\s*(\d\d:\d\d)?",
+                                      clean(identity[1]))
+                  if not info:
+                      continue
+                  day, month, year, home, away, start = info.groups()
+                  if "sudtirol" not in (key(home), key(away)):
+                      continue
+                  final = "giocata" in state[1].split()
+                  if not final and state[1].strip():
+                      continue
+                  result = ""
+                  if final:
+                      goals = [re.search(r'class="gol gol-' + side + r'"[^>]*>\s*(\d{1,2})\s*<', card)
+                               for side in ("home", "away")]
+                      if not all(goals):
+                          continue
+                      result = score(*(int(g[1]) for g in goals))
+                  if not final and not re.search(r'class="gol"[^>]*>\s*' + re.escape(start or "") + r"\s*<", card):
+                      start = ""
+                  day = date(int(year), MONTHS.index(month) + 1, int(day)).isoformat()
+                  rows.append(fixture(day, start or "", home, away, "Serie B", result))
+              return rows
+
+
+          def load_sudtirol(year):
+              url = FCS.format(season=f"{year}-{year+1}")
+              return sudtirol(text(url)), [{"label": "Lega B · Calendario Südtirol", "url": url}]
+
+
+          def hockey_rows(html):
+              for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", html, re.S):
+                  yield row, re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)
+
+
+          def bolzano(html):
+              rows = []
+              for row, cells in hockey_rows(html):
+                  match = re.search(r'class="fulldate">(\d\d/\d\d/\d{4})(?: (\d\d:\d\d))?</span>', row)
+                  names = [clean(name) for name in re.findall(r'class="fullname">([^<]+)</span>', row)]
+                  if not match or len(names) != 2 or len(cells) != 4 or "bolzano" not in map(key, names):
+                      continue
+                  final = 'title="finished"' in cells[3]
+                  if not final and 'title="scheduled"' not in cells[3]:
+                      continue
+                  result = ""
+                  if final:
+                      goals = re.match(r"^(\d{1,2}):(\d{1,2})", clean(cells[3]))
+                      if not goals:
+                          continue
+                      result = score(int(goals[1]), int(goals[2]))
+                  day = datetime.strptime(match[1], "%d/%m/%Y").date().isoformat()
+                  rows.append(fixture(day, match[2] or "", *names, "ICE Hockey League", result))
+              return rows
+
+
+          def orf_finals(html, season):
+              day = None
+              scores = {}
+              for row, cells in hockey_rows(html):
+                  if not cells or not all(f'class="col{i}"' in row for i in range(1, 5)):
+                      continue
+                  if len(cells) != 4:
+                      continue
+                  date_text, home, away, result = map(clean, cells)
+                  if date_text:
+                      d = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.", date_text)
+                      if not d:
+                          day = None
+                          continue
+                      month = int(d[2])
+                      day = date(season if month >= 7 else season + 1, month, int(d[1])).isoformat()
+                  if not day or "bolzano" not in (key(home), key(away)):
+                      continue
+                  goals = re.fullmatch(r"(\d{1,2}):(\d{1,2})(?: n\.[VP]\.)?", result)
+                  if goals:
+                      scores[(day, key(home), key(away))] = score(int(goals[1]), int(goals[2]))
+              return scores
+
+
+          def load_bolzano(year):
+              rows = bolzano(text(HCB))
+              sources = [{"label": "HC Bolzano · Calendario ICEHL", "url": HCB}]
+              try:
+                  scores = orf_finals(text(ORF), year)
+              except (OSError, ValueError):
+                  scores = {}
+              if scores:
+                  sources.append({"label": "ORF Sport · Risultati ICEHL", "url": ORF})
+              for row in rows:
+                  other = scores.get((row["date"], key(row["home"]), key(row["away"])))
+                  if other and (not row["result"] or row["result"] == other):
+                      row["result"] = other
+                  elif other:
+                      print(f"Foxes {row['date']}: fonti discordanti, gara saltata.")
+                      row["conflict"] = True
+              return rows, sources
+
+
+          def identity(game):
+              return (game["competition"], key(game["home"]), key(game["away"]))
+
+
+          def merge(items, observed, today):
+              result = [dict(item) for item in items]
+              original = Counter(identity(item) for item in items)
+              incoming = Counter(identity(item) for item in observed)
+              exact = {(identity(item), item["date"]): index for index, item in enumerate(items)}
+              changed = 0
+              for row in observed:
+                  if row.get("conflict"):
+                      continue
+                  pair = identity(row)
+                  index = exact.get((pair, row["date"]))
+                  if index is None and original[pair] == incoming[pair] == 1:
+                      index = next(i for i, item in enumerate(items) if identity(item) == pair)
+                  if index is None:
+                      # A new fixture can be a postponed game with a changed name or a repeated hockey matchup.
+                      # Add it only when both teams are already known and the clubs never meet in this order.
+                      known = {key(item[side]) for item in items for side in ("home", "away")}
+                      if original[pair] or incoming[pair] != 1 or row["date"] < today or not row["time"]:
+                          continue
+                      if any(key(row[side]) not in known for side in ("home", "away")):
+                          continue
+                      names = {key(item[side]): item[side] for item in items for side in ("home", "away")}
+                      result.append({**row, "home": names[key(row["home"])], "away": names[key(row["away"])]})
+                      changed += 1
+                      continue
+                  before = items[index]
+                  if before["result"]:
+                      if row["result"] and row["result"].replace("–", ":") != re.sub(r"[-–]", ":", before["result"]):
+                          print(f"{row['competition']} {row['date']}: finale discordante, conservato quello esistente.")
+                      continue
+                  after = result[index]
+                  if row["date"] != before["date"] and not row["result"] and row["time"] and row["date"] >= today:
+                      after["date"] = row["date"]
+                  if row["date"] == after["date"] and not row["result"] and row["time"] and after["date"] >= today:
+                      after["time"] = row["time"]
+                  if row["result"] and row["date"] == before["date"] and row["date"] <= today:
+                      after["result"] = row["result"]
+                  if after != before:
+                      changed += 1
+              return sorted(result, key=lambda item: (item["date"], item["time"])), changed
+
+
+          def auth():
+              base = urlsplit(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"])
+              if base.scheme != "https" or base.username or base.password:
+                  raise ValueError("Endpoint token GitHub non valido")
+              pairs = [(k, v) for k, v in parse_qsl(base.query, keep_blank_values=True) if k != "audience"]
+              url = urlunsplit(base._replace(query=urlencode(pairs + [("audience", VERIFY)])))
+              token = json.loads(request(url, token=os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"],
+                                         oidc_header="Authorization")[1])["value"]
+              if not isinstance(token, str) or not token or request(VERIFY, token=token)[0] != 204:
+                  raise ValueError("Verifica OIDC Tribuna non riuscita")
+              return token
+
+
+          def synchronize(club, rows, sources, today, apply, token):
+              if len(rows) < 12 or len({(identity(row), row["date"]) for row in rows}) != len(rows):
+                  raise ValueError("Calendario della fonte incompleto o ambiguo")
+              for attempt in range(2):
+                  current = read_json(SITE + "/api/calendar")[club]
+                  items, changed = merge(current["items"], rows, today)
+                  if not changed or not apply:
+                      print(f"{club}: {len(rows)} gare dalla fonte, {changed} variazioni {('rilevate' if apply else 'in anteprima')}.")
+                      return
+                  links = list(current["sources"])
+                  for source in sources:
+                      if not any(saved["url"] == source["url"] for saved in links) and len(links) < 12:
+                          links.append(source)
+                  payload = {"previousUpdatedAt": current["updatedAt"], "items": items, "sources": links}
+                  try:
+                      request(SITE + "/api/calendar/" + club, token=token, payload=payload)
+                  except HTTPError as err:
+                      if err.code == 409 and attempt == 0:
+                          time.sleep(1)
+                          continue
+                      raise
+                  verified = read_json(SITE + "/api/calendar")[club]
+                  if verified["items"] != items:
+                      raise ValueError("Lettura dopo il salvataggio discordante")
+                  read_json(SITE + "/api/updates")
+                  print(f"{club}: {changed} variazioni salvate e verificate.")
+                  return
+
+
+          def main():
+              now = datetime.now(ROME).date()
+              year = now.year if now.month >= 7 else now.year - 1
+              apply = os.environ.get("TRIBUNA_APPLY") == "true"
+              token = auth()
+              failures = []
+              with ThreadPoolExecutor(max_workers=3) as pool:
+                  tasks = {club: pool.submit(loader, year) for club, loader in
+                           (("monza", load_monza), ("fcs", load_sudtirol), ("hcb", load_bolzano))}
+                  for club, task in tasks.items():
+                      try:
+                          rows, sources = task.result()
+                          if any(not f"{year}-07-01" <= row["date"] <= f"{year+1}-06-30" for row in rows):
+                              raise ValueError("La fonte presenta una stagione differente")
+                          synchronize(club, rows, sources, now.isoformat(), apply, token)
+                      except HTTPError as err:
+                          failures.append(f"{club} HTTP {err.code}")
+                      except (OSError, ValueError, KeyError, StopIteration, TypeError) as err:
+                          failures.append(f"{club} ({type(err).__name__})")
+              if failures:
+                  print("Verifica incompleta: " + ", ".join(failures), file=sys.stderr)
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except HTTPError as err:
+                  print(f"Avvio rifiutato: HTTP {err.code}", file=sys.stderr)
+                  sys.exit(1)
+              except (OSError, ValueError, KeyError, TypeError) as err:
+                  print(f"Avvio non riuscito ({type(err).__name__}).", file=sys.stderr)
+                  sys.exit(1)
+          PYTHON
